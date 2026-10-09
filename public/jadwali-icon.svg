@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <!-- جَدولي Vector Symbol - Transparent Silhouette -->
+  <defs>
+    <linearGradient id="sym-emerald" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+    <linearGradient id="sym-amber" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FBBF24" />
+      <stop offset="100%" stop-color="#D97706" />
+    </linearGradient>
+    <linearGradient id="sym-teal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06B6D4" />
+      <stop offset="100%" stop-color="#0E7490" />
+    </linearGradient>
+    <linearGradient id="sym-rose" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FB7185" />
+      <stop offset="100%" stop-color="#E11D48" />
+    </linearGradient>
+  </defs>
+
+  <!-- Multiplication Array Matrix (Rotated 45 degrees forming the Multiplication X) -->
+  <g transform="translate(50, 50) rotate(45)">
+    <!-- Quadrant 1: Top (Rotated) - Emerald Green -->
+    <rect x="4" y="-34" width="30" height="30" rx="9" fill="url(#sym-emerald)" />
+    <!-- Quadrant 2: Right (Rotated) - Sun Amber -->
+    <rect x="4" y="4" width="30" height="30" rx="9" fill="url(#sym-amber)" />
+    <!-- Quadrant 3: Bottom (Rotated) - Cyan Teal -->
+    <rect x="-34" y="4" width="30" height="30" rx="9" fill="url(#sym-teal)" />
+    <!-- Quadrant 4: Left (Rotated) - Crimson Rose -->
+    <rect x="-34" y="-34" width="30" height="30" rx="9" fill="url(#sym-rose)" />
+
+    <!-- Central Multiplication Node Core -->
+    <circle cx="0" cy="0" r="5" fill="#FFFFFF" />
+  </g>
+
+  <!-- Sparkle of Multiplication Discovery -->
+  <path d="M 50 43.5 Q 50 50 43.5 50 Q 50 50 50 56.5 Q 50 50 56.5 50 Q 50 50 50 43.5 Z" fill="#FDE047" stroke="#FFFFFF" stroke-width="0.75" />
+</svg>

@@ -1,0 +1,6 @@
+{
+  "name": "MathVoyage: Multiplication Adventure",
+  "description": "Interactive multiplication learning game for primary school children (Grades 1-4) featuring visual explanations, adaptive mastery, 8+ engaging math mini-games, and progress tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
