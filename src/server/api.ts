@@ -10,6 +10,7 @@ import {
   updateUserSettings,
   resetUserProgress,
   claimDailyReward,
+  mergeGuestIntoUser,
 } from '../db/users.ts';
 import { db } from '../db/index.ts';
 import { sql } from 'drizzle-orm';
@@ -123,36 +124,25 @@ apiApp.get('/api/me', optionalAuth, async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/sync — merges local guest progress into the signed-in account
+// POST /api/sync — on sign-in, merges this browser's guest progress into the account.
+// Both identities come from the server (signed cookie + verified Firebase token);
+// the request body is only read for an optional display name. Facts, stars,
+// sessions and daily claims are moved from the database, never taken from the client.
 apiApp.post('/api/sync', optionalAuth, async (req: Request, res: Response) => {
   try {
+    if (!isAuthenticated(req)) {
+      res.status(401).json({ error: 'Sign-in required' });
+      return;
+    }
     const uid = getUid(req);
-    const { guestFacts, guestBadges, displayName } = req.body ?? {};
-
+    const { displayName } = req.body ?? {};
     await getOrCreateUser(uid, getEmail(req), sanitizeName(displayName));
 
-    if (Array.isArray(guestFacts)) {
-      for (const f of guestFacts.slice(0, 144)) {
-        const fact = parseFact(f);
-        if (!fact) continue;
-        await updateFactMastery(uid, {
-          ...fact,
-          isCorrect: typeof f.correct === 'number' && f.correct > 0,
-          wrongAnswer: Array.isArray(f.commonMistakes) ? parseWrongAnswer(f.commonMistakes.at(-1)) : undefined,
-        });
-      }
-    }
-
-    if (Array.isArray(guestBadges)) {
-      for (const badgeId of guestBadges.slice(0, 100)) {
-        if (typeof badgeId === 'string' && VALID_BADGES.has(badgeId)) {
-          await unlockBadge(uid, badgeId);
-        }
-      }
-    }
+    const guestId = (req as GuestRequest).guestId;
+    const merge = guestId ? await mergeGuestIntoUser(`g_${guestId}`, uid) : { merged: false };
 
     const updatedProfile = await getUserProfile(uid);
-    res.json({ success: true, profile: updatedProfile });
+    res.json({ success: true, merged: merge.merged, profile: updatedProfile });
   } catch (error) {
     fail(res, '/api/sync', error, 'Failed to sync progress');
   }

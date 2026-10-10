@@ -237,6 +237,108 @@ export async function resetUserProgress(uid: string) {
   }
 }
 
+/**
+ * Moves everything a guest earned into a signed-in account, then deletes the
+ * guest row. Runs entirely on the server: the guest id comes from the signed
+ * cookie and the account uid from the verified Firebase token, so nothing in
+ * the request body is trusted.
+ *
+ * - Stars: the guest's stars are added, minus the reward for any UTC day the
+ *   account had already claimed (no double daily reward per person).
+ * - Daily claims and game sessions: moved; same-day duplicate claims dropped.
+ * - Facts: moved; when both sides practised the same fact, attempts and
+ *   correct answers are summed and mastery is recomputed with the usual rule.
+ * - Badges: union.
+ *
+ * Idempotent and safe under concurrent calls (sign-in fires two syncs): the
+ * guest row is locked first, and a second caller finds it already gone.
+ */
+export async function mergeGuestIntoUser(guestUid: string, accountUid: string) {
+  if (!guestUid.startsWith('g_') || guestUid === accountUid) return { merged: false };
+  try {
+    return await db.transaction(async (tx) => {
+      // Lock order is always guest then account, so concurrent merges cannot deadlock.
+      const [guest] = await tx.select().from(users).where(eq(users.uid, guestUid)).limit(1).for('update');
+      if (!guest) return { merged: false };
+      const [account] = await tx.select().from(users).where(eq(users.uid, accountUid)).limit(1).for('update');
+      if (!account) throw new Error('Account row must exist before merging');
+
+      // Daily claims
+      const accountDates = new Set(
+        (await tx.select({ d: dailyClaims.claimDate }).from(dailyClaims).where(eq(dailyClaims.userId, account.id)))
+          .map((r) => r.d)
+      );
+      const guestClaims = await tx.select().from(dailyClaims).where(eq(dailyClaims.userId, guest.id));
+      let duplicateStars = 0;
+      for (const c of guestClaims) {
+        if (accountDates.has(c.claimDate)) {
+          duplicateStars += c.starsAwarded;
+          await tx.delete(dailyClaims).where(eq(dailyClaims.id, c.id));
+        } else {
+          await tx.update(dailyClaims).set({ userId: account.id }).where(eq(dailyClaims.id, c.id));
+        }
+      }
+
+      // Game sessions
+      await tx.update(gameSessions).set({ userId: account.id }).where(eq(gameSessions.userId, guest.id));
+
+      // Facts
+      const accountFacts = new Map(
+        (await tx.select().from(factsMastery).where(eq(factsMastery.userId, account.id))).map((f) => [f.factKey, f])
+      );
+      const guestFacts = await tx.select().from(factsMastery).where(eq(factsMastery.userId, guest.id));
+      for (const g of guestFacts) {
+        const a = accountFacts.get(g.factKey);
+        if (!a) {
+          await tx.update(factsMastery).set({ userId: account.id }).where(eq(factsMastery.id, g.id));
+          continue;
+        }
+        const attempts = a.attempts + g.attempts;
+        const correct = a.correct + g.correct;
+        const guestIsNewer = (g.updatedAt?.getTime() ?? 0) > (a.updatedAt?.getTime() ?? 0);
+        const consecutiveCorrect = guestIsNewer ? g.consecutiveCorrect : a.consecutiveCorrect;
+        const isMastered = consecutiveCorrect >= 3 && attempts > 0 && correct / attempts >= 0.75;
+        const parse = (s: string | null) => {
+          try {
+            const v = JSON.parse(s || '[]');
+            return Array.isArray(v) ? v.filter((n) => Number.isInteger(n)) : [];
+          } catch {
+            return [];
+          }
+        };
+        const mistakes = [...parse(a.commonMistakes), ...parse(g.commonMistakes)].slice(-5);
+        await tx
+          .update(factsMastery)
+          .set({ attempts, correct, consecutiveCorrect, isMastered, commonMistakes: JSON.stringify(mistakes), updatedAt: new Date() })
+          .where(eq(factsMastery.id, a.id));
+        await tx.delete(factsMastery).where(eq(factsMastery.id, g.id));
+      }
+
+      // Badges
+      const guestBadges = await tx.select().from(badges).where(eq(badges.userId, guest.id));
+      for (const b of guestBadges) {
+        await tx
+          .insert(badges)
+          .values({ userId: account.id, badgeId: b.badgeId })
+          .onConflictDoNothing({ target: [badges.userId, badges.badgeId] });
+      }
+      await tx.delete(badges).where(eq(badges.userId, guest.id));
+
+      // Stars, then remove the guest so the merge can never run twice.
+      const starsMoved = Math.max(0, guest.stars - duplicateStars);
+      if (starsMoved > 0) {
+        await tx.update(users).set(addStarsSet(starsMoved)).where(eq(users.id, account.id));
+      }
+      await tx.delete(users).where(eq(users.id, guest.id));
+
+      return { merged: true, starsMoved };
+    });
+  } catch (error) {
+    console.error('Database mergeGuestIntoUser failed:', error);
+    throw new Error('Database guest merge failed', { cause: error });
+  }
+}
+
 function utcDate(offsetDays = 0): string {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() + offsetDays);

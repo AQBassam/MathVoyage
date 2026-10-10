@@ -208,16 +208,12 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const syncWithCloud = async (token: string, user: User) => {
     try {
-      const factsArray = Object.values(progress.factsMastery);
+      // The server moves this browser's guest progress into the account (once).
+      // Local facts are not re-sent: doing so on every page load inflated attempts.
       await fetch('/api/sync', {
         method: 'POST',
         headers: getHeaders(token),
-        body: JSON.stringify({
-          displayName: user.displayName || progress.playerName,
-          guestFacts: factsArray,
-          guestBadges: progress.unlockedBadges,
-          guestStars: progress.stars,
-        }),
+        body: JSON.stringify({ displayName: user.displayName || progress.playerName }),
       });
 
       const res = await fetch('/api/me', { headers: getHeaders(token) });
@@ -256,7 +252,8 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         });
       }
 
-      const totalStars = Math.max(prev.stars, user?.stars || 0);
+      // Stars are computed on the server; when it has a row for this player it is authoritative.
+      const totalStars = typeof user?.stars === 'number' ? user.stars : prev.stars;
       const level = Math.max(1, Math.floor(totalStars / 15) + 1);
 
       // Calculate unlocked stages based on stars
@@ -500,6 +497,51 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const claimDailyReward = async (): Promise<{ starsAdded: number; streak: number }> => {
     const today = getTodayDateString();
+
+    // Server first: it decides whether today was already claimed (e.g. on another
+    // device with the same account) and returns the real streak and star total.
+    try {
+      const res = await fetch('/api/daily-reward/claim', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: '{}',
+      });
+      if (res.ok) {
+        const r = await res.json();
+        if (typeof r.stars === 'number' && typeof r.streak === 'number') {
+          const streakBadges = [
+            ...(r.streak >= 3 ? ['daily_streak_3'] : []),
+            ...(r.streak >= 7 ? ['daily_streak_7'] : []),
+          ];
+          setProgress((prev) => {
+            const stages = [1];
+            if (r.stars >= 5) stages.push(2);
+            if (r.stars >= 20) stages.push(3);
+            if (r.stars >= 45) stages.push(4);
+            if (r.stars >= 75) stages.push(5);
+            if (r.stars >= 110) stages.push(6);
+            return {
+              ...prev,
+              stars: r.stars,
+              level: typeof r.level === 'number' ? r.level : Math.max(1, Math.floor(r.stars / 15) + 1),
+              unlockedStages: stages,
+              unlockedBadges: Array.from(new Set([...prev.unlockedBadges, ...streakBadges])),
+              dailyReward: {
+                lastClaimDate: today,
+                currentStreakDays: r.streak,
+                totalDailyClaims: (prev.dailyReward?.totalDailyClaims || 0) + (r.alreadyClaimed ? 0 : 1),
+                lastClaimBonusStars: r.starsAdded ?? 0,
+              },
+            };
+          });
+          return { starsAdded: r.starsAdded ?? 0, streak: r.streak };
+        }
+      }
+    } catch (e) {
+      console.warn('Daily reward: server unreachable, using offline fallback:', e);
+    }
+
+    // Offline fallback (local only).
     const lastClaim = progress.dailyReward?.lastClaimDate;
 
     let newStreak = 1;
@@ -562,21 +604,6 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         },
       };
     });
-
-    // Notify backend
-    try {
-      await fetch('/api/daily-reward/claim', {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ streak: newStreak, bonusStars }),
-      });
-
-      for (const badgeId of unlockedStreakBadges) {
-        unlockBadge(badgeId);
-      }
-    } catch (e) {
-      console.warn('Daily reward claim offline fallback:', e);
-    }
 
     return { starsAdded: bonusStars, streak: newStreak };
   };
