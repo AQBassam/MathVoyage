@@ -69,11 +69,34 @@ export async function getUserProfile(uid: string) {
       .limit(50);
     const userBadges = await db.select().from(badges).where(eq(badges.userId, user.id));
 
+    // Daily-reward state lives on the server so every device of the same account agrees.
+    const [lastClaim] = await db
+      .select()
+      .from(dailyClaims)
+      .where(eq(dailyClaims.userId, user.id))
+      .orderBy(sql`${dailyClaims.claimDate} DESC`)
+      .limit(1);
+    const [{ total }] = await db
+      .select({ total: sql<number>`count(*)::int` })
+      .from(dailyClaims)
+      .where(eq(dailyClaims.userId, user.id));
+    // A streak is still alive only if the last claim was today or yesterday (UTC).
+    const streakAlive = lastClaim && lastClaim.claimDate >= utcDate(-1);
+    const dailyReward = lastClaim
+      ? {
+          lastClaimDate: lastClaim.claimDate,
+          currentStreakDays: streakAlive ? lastClaim.streak : 0,
+          totalDailyClaims: total,
+          lastClaimBonusStars: lastClaim.starsAwarded,
+        }
+      : null;
+
     return {
       user,
       facts,
       sessions,
       badges: userBadges.map((b) => b.badgeId),
+      dailyReward,
     };
   } catch (error) {
     console.error('Database getUserProfile failed:', error);

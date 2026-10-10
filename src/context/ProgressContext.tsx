@@ -229,7 +229,7 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   };
 
   const integrateBackendProfile = (profile: any) => {
-    const { user, facts, sessions, badges } = profile;
+    const { user, facts, sessions, badges, dailyReward } = profile;
     setProgress((prev) => {
       const newFactMap = { ...prev.factsMastery };
       if (Array.isArray(facts)) {
@@ -276,6 +276,8 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         factsMastery: newFactMap,
         unlockedStages: stages,
         unlockedBadges: mergedBadges,
+        // Server is authoritative for the daily reward when it has a record for this player.
+        dailyReward: dailyReward ?? prev.dailyReward,
       };
     });
   };
