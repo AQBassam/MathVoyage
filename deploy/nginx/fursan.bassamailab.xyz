@@ -1,0 +1,38 @@
+# /etc/nginx/sites-available/fursan.bassamailab.xyz
+# Port 80 only. `certbot --nginx -d fursan.bassamailab.xyz` adds the 443/TLS part
+# and the HTTP->HTTPS redirect, exactly as it did for n8n/atlas/files.
+
+# Per-IP API limit. Generous because a whole classroom can share one school IP.
+limit_req_zone $binary_remote_addr zone=fursan_api:10m rate=30r/s;
+
+server {
+    listen 80;
+    server_name fursan.bassamailab.xyz;
+
+    client_max_body_size 128k;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location /api/ {
+        limit_req zone=fursan_api burst=100 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://127.0.0.1:3100;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3100;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

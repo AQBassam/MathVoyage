@@ -1,4 +1,4 @@
-import { boolean, integer, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import { boolean, integer, pgTable, serial, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
 
 export const users = pgTable('users', {
@@ -28,7 +28,7 @@ export const factsMastery = pgTable('facts_mastery', {
   isMastered: boolean('is_mastered').default(false).notNull(),
   commonMistakes: text('common_mistakes').default('[]').notNull(),
   updatedAt: timestamp('updated_at').defaultNow(),
-});
+}, (t) => [uniqueIndex('facts_mastery_user_fact_uq').on(t.userId, t.factKey)]);
 
 export const gameSessions = pgTable('game_sessions', {
   id: serial('id').primaryKey(),
@@ -51,7 +51,19 @@ export const badges = pgTable('badges', {
     .notNull(),
   badgeId: text('badge_id').notNull(),
   unlockedAt: timestamp('unlocked_at').defaultNow(),
-});
+}, (t) => [uniqueIndex('badges_user_badge_uq').on(t.userId, t.badgeId)]);
+
+// One row per user per UTC day. The unique index makes the daily reward idempotent.
+export const dailyClaims = pgTable('daily_claims', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  claimDate: text('claim_date').notNull(), // YYYY-MM-DD (UTC)
+  streak: integer('streak').notNull(),
+  starsAwarded: integer('stars_awarded').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+}, (t) => [uniqueIndex('daily_claims_user_date_uq').on(t.userId, t.claimDate)]);
 
 export const usersRelations = relations(users, ({ many }) => ({
   factsMastery: many(factsMastery),

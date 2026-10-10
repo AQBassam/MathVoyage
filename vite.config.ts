@@ -2,7 +2,6 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
-import { apiApp } from './src/server/api.ts';
 
 export default defineConfig(() => {
   return {
@@ -11,7 +10,9 @@ export default defineConfig(() => {
       tailwindcss(),
       {
         name: 'cloudsql-api-server',
-        configureServer(server) {
+        // Dev only: loaded lazily so `vite build` never imports server code or needs DB/session config.
+        async configureServer(server) {
+          const { apiApp } = await import('./src/server/api.ts');
           server.middlewares.use(apiApp);
         },
       },

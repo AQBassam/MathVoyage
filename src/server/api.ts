@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
-import { optionalAuth, requireAuth, AuthRequest } from '../middleware/auth.ts';
+import { optionalAuth, AuthRequest } from '../middleware/auth.ts';
+import { guestIdentity, GuestRequest } from './identity.ts';
 import {
   getOrCreateUser,
   getUserProfile,
@@ -8,140 +9,205 @@ import {
   unlockBadge,
   updateUserSettings,
   resetUserProgress,
+  claimDailyReward,
 } from '../db/users.ts';
 import { db } from '../db/index.ts';
-import { factsMastery, gameSessions, users } from '../db/schema.ts';
-import { eq, sql } from 'drizzle-orm';
+import { sql } from 'drizzle-orm';
+import { ALL_BADGES } from '../data/multiplicationData.ts';
+import type { GameType } from '../types/game.ts';
 
 export const apiApp = express();
-apiApp.use(express.json());
+apiApp.disable('x-powered-by');
+apiApp.use('/api', express.json({ limit: '64kb' }));
+apiApp.use('/api', guestIdentity);
 
-// Helper to get effective UID (either from authenticated Firebase token or guest fallback identifier)
+// ---------- identity ----------
+
+/** Verified Firebase uid when signed in; otherwise the server-issued guest id from the signed cookie. */
 function getUid(req: Request): string {
   const authReq = req as AuthRequest;
-  if (authReq.user?.uid) {
-    return authReq.user.uid;
-  }
-  const clientUid = req.headers['x-guest-uid'] as string;
-  if (clientUid && clientUid.trim().length > 0) {
-    return `guest_${clientUid.trim()}`;
-  }
-  return 'guest_default_player';
+  if (authReq.user?.uid) return authReq.user.uid;
+  const guestId = (req as GuestRequest).guestId;
+  if (!guestId) throw new Error('guestIdentity middleware did not run');
+  return `g_${guestId}`;
+}
+
+function isAuthenticated(req: Request): boolean {
+  return Boolean((req as AuthRequest).user?.uid);
 }
 
 function getEmail(req: Request): string {
   const authReq = req as AuthRequest;
-  if (authReq.user?.email) {
-    return authReq.user.email;
-  }
-  const uid = getUid(req);
-  return `${uid}@guest.local`;
+  return authReq.user?.email || `${getUid(req)}@guest.local`;
 }
 
-// GET /api/me
-apiApp.get('/api/me', optionalAuth, async (req: Request, res: Response) => {
+// ---------- validation ----------
+
+const VALID_BADGES = new Set(ALL_BADGES.map((b) => b.id));
+const VALID_GAME_TYPES = new Set<GameType>([
+  'visuals', 'equation', 'choice', 'missing', 'pairs', 'build', 'race',
+  'mixed', 'truefalse', 'memory', 'maze', 'bingo', 'detective', 'timechallenge',
+]);
+
+function isInt(v: unknown, min: number, max: number): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/** Trims, strips control characters and caps length. Returns undefined when nothing usable remains. */
+function sanitizeName(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const clean = v.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40);
+  return clean.length ? clean : undefined;
+}
+
+/** The client sends the name URI-encoded, because HTTP headers cannot carry Arabic characters. */
+function nameFromHeader(req: Request): string | undefined {
+  const raw = req.headers['x-player-name'];
+  if (typeof raw !== 'string') return undefined;
   try {
-    const uid = getUid(req);
-    const email = getEmail(req);
-    const authReq = req as AuthRequest;
-    const displayName = authReq.user?.name || req.headers['x-player-name'] as string || 'بطل الرياضيات';
+    return sanitizeName(decodeURIComponent(raw));
+  } catch {
+    return undefined;
+  }
+}
 
-    const user = await getOrCreateUser(uid, email, displayName);
-    const profile = await getUserProfile(uid);
+function parseFact(f: any) {
+  if (!f || !isInt(f.factorA, 0, 12) || !isInt(f.factorB, 0, 12)) return null;
+  return {
+    factorA: f.factorA as number,
+    factorB: f.factorB as number,
+  };
+}
 
-    res.json({
-      user,
-      profile,
-    });
-  } catch (error) {
-    console.error('API /api/me error:', error);
-    res.status(500).json({ error: 'Failed to retrieve profile' });
+function parseWrongAnswer(v: unknown): number | undefined {
+  return isInt(v, -1000, 100000) ? v : undefined;
+}
+
+/** Stars per session, recomputed on the server with the same thresholds as GamePlayScreen. */
+function starsForAccuracy(accuracy: number): number {
+  if (accuracy >= 90) return 3;
+  if (accuracy >= 60) return 2;
+  return 1;
+}
+
+function fail(res: Response, label: string, error: unknown, message: string) {
+  console.error(`API ${label} error:`, error);
+  res.status(500).json({ error: message });
+}
+
+// ---------- routes ----------
+
+// GET /api/health — liveness and database connectivity
+apiApp.get('/api/health', async (_req: Request, res: Response) => {
+  try {
+    await db.execute(sql`select 1`);
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
   }
 });
 
-// POST /api/sync
+// GET /api/me — read-only for guests, so crawlers and one-off visits do not create rows
+apiApp.get('/api/me', optionalAuth, async (req: Request, res: Response) => {
+  try {
+    const uid = getUid(req);
+    const authReq = req as AuthRequest;
+    let user = null;
+    if (isAuthenticated(req)) {
+      user = await getOrCreateUser(uid, getEmail(req), sanitizeName(authReq.user?.name) || nameFromHeader(req));
+    }
+    const profile = await getUserProfile(uid);
+    res.json({ user: user ?? profile?.user ?? null, profile });
+  } catch (error) {
+    fail(res, '/api/me', error, 'Failed to retrieve profile');
+  }
+});
+
+// POST /api/sync — merges local guest progress into the signed-in account
 apiApp.post('/api/sync', optionalAuth, async (req: Request, res: Response) => {
   try {
     const uid = getUid(req);
-    const email = getEmail(req);
-    const { guestFacts, guestSessions, guestStars, guestBadges, displayName } = req.body;
+    const { guestFacts, guestBadges, displayName } = req.body ?? {};
 
-    const user = await getOrCreateUser(uid, email, displayName);
+    await getOrCreateUser(uid, getEmail(req), sanitizeName(displayName));
 
     if (Array.isArray(guestFacts)) {
-      for (const f of guestFacts) {
-        if (f.factorA && f.factorB) {
-          await updateFactMastery(uid, {
-            factorA: f.factorA,
-            factorB: f.factorB,
-            isCorrect: f.correct > 0,
-            wrongAnswer: f.lastMistake,
-          });
-        }
+      for (const f of guestFacts.slice(0, 144)) {
+        const fact = parseFact(f);
+        if (!fact) continue;
+        await updateFactMastery(uid, {
+          ...fact,
+          isCorrect: typeof f.correct === 'number' && f.correct > 0,
+          wrongAnswer: Array.isArray(f.commonMistakes) ? parseWrongAnswer(f.commonMistakes.at(-1)) : undefined,
+        });
       }
     }
 
     if (Array.isArray(guestBadges)) {
-      for (const badgeId of guestBadges) {
-        await unlockBadge(uid, badgeId);
+      for (const badgeId of guestBadges.slice(0, 100)) {
+        if (typeof badgeId === 'string' && VALID_BADGES.has(badgeId)) {
+          await unlockBadge(uid, badgeId);
+        }
       }
     }
 
     const updatedProfile = await getUserProfile(uid);
     res.json({ success: true, profile: updatedProfile });
   } catch (error) {
-    console.error('API /api/sync error:', error);
-    res.status(500).json({ error: 'Failed to sync progress' });
+    fail(res, '/api/sync', error, 'Failed to sync progress');
   }
 });
 
 // POST /api/facts/record
 apiApp.post('/api/facts/record', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const { factorA, factorB, isCorrect, wrongAnswer } = req.body;
-
-    if (typeof factorA !== 'number' || typeof factorB !== 'number' || typeof isCorrect !== 'boolean') {
+    const body = req.body ?? {};
+    const fact = parseFact(body);
+    if (!fact || typeof body.isCorrect !== 'boolean') {
       return res.status(400).json({ error: 'Invalid fact record payload' });
     }
 
-    await updateFactMastery(uid, {
-      factorA,
-      factorB,
-      isCorrect,
-      wrongAnswer,
+    await updateFactMastery(getUid(req), {
+      ...fact,
+      isCorrect: body.isCorrect,
+      wrongAnswer: parseWrongAnswer(body.wrongAnswer),
     });
 
     res.json({ success: true });
   } catch (error) {
-    console.error('API /api/facts/record error:', error);
-    res.status(500).json({ error: 'Failed to record fact attempt' });
+    fail(res, '/api/facts/record', error, 'Failed to record fact attempt');
   }
 });
 
-// POST /api/sessions
+// POST /api/sessions — stars and accuracy are recomputed on the server
 apiApp.post('/api/sessions', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const { gameType, tableNumber, score, totalQuestions, starsEarned, accuracyPercent } = req.body;
+    const { gameType, tableNumber, score, totalQuestions } = req.body ?? {};
 
-    if (!gameType || typeof score !== 'number' || typeof totalQuestions !== 'number') {
+    if (
+      typeof gameType !== 'string' ||
+      !VALID_GAME_TYPES.has(gameType as GameType) ||
+      !isInt(totalQuestions, 0, 500) ||
+      !isInt(score, 0, 100000)
+    ) {
       return res.status(400).json({ error: 'Invalid session payload' });
     }
 
-    const result = await recordGameSession(uid, {
+    const boundedScore = Math.min(score, totalQuestions);
+    const accuracyPercent = totalQuestions > 0 ? Math.round((boundedScore / totalQuestions) * 100) : 100;
+
+    const result = await recordGameSession(getUid(req), {
       gameType,
-      tableNumber: tableNumber || 0,
-      score,
+      tableNumber: isInt(tableNumber, 0, 10) ? tableNumber : 0,
+      score: boundedScore,
       totalQuestions,
-      starsEarned: starsEarned || 0,
-      accuracyPercent: accuracyPercent || 0,
+      starsEarned: starsForAccuracy(accuracyPercent),
+      accuracyPercent,
     });
 
     res.json(result);
   } catch (error) {
-    console.error('API /api/sessions error:', error);
-    res.status(500).json({ error: 'Failed to record game session' });
+    fail(res, '/api/sessions', error, 'Failed to record game session');
   }
 });
 
@@ -164,7 +230,6 @@ apiApp.get('/api/progress', optionalAuth, async (req: Request, res: Response) =>
 
     const { facts, user, sessions, badges: unlockedBadges } = profile;
 
-    // Build fact stats map
     const factMap: Record<string, any> = {};
     let totalAttempts = 0;
     let totalCorrect = 0;
@@ -193,15 +258,11 @@ apiApp.get('/api/progress', optionalAuth, async (req: Request, res: Response) =>
       }
     });
 
-    // Compute stats per table (1 to 10)
     const tableStats: Record<number, { mastered: number; total: number; percent: number }> = {};
     for (let t = 1; t <= 10; t++) {
       let masteredInT = 0;
       for (let j = 1; j <= 10; j++) {
-        const key = `${t}x${j}`;
-        if (factMap[key]?.isMastered) {
-          masteredInT++;
-        }
+        if (factMap[`${t}x${j}`]?.isMastered) masteredInT++;
       }
       tableStats[t] = {
         mastered: masteredInT,
@@ -210,7 +271,6 @@ apiApp.get('/api/progress', optionalAuth, async (req: Request, res: Response) =>
       };
     }
 
-    // Identify recommendations: struggling facts first, then unmastered facts from lowest table
     const recommendations: Array<{ factorA: number; factorB: number; reason: string }> = [];
     strugglingFacts.slice(0, 3).forEach((sf) => {
       recommendations.push({
@@ -251,88 +311,60 @@ apiApp.get('/api/progress', optionalAuth, async (req: Request, res: Response) =>
       recentSessions: sessions.slice(0, 10),
     });
   } catch (error) {
-    console.error('API /api/progress error:', error);
-    res.status(500).json({ error: 'Failed to calculate progress' });
+    fail(res, '/api/progress', error, 'Failed to calculate progress');
   }
 });
 
-// POST /api/badges/unlock
+// POST /api/badges/unlock — only known badge ids are accepted
 apiApp.post('/api/badges/unlock', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const { badgeId } = req.body;
-    if (!badgeId) return res.status(400).json({ error: 'badgeId required' });
-    await unlockBadge(uid, badgeId);
+    const { badgeId } = req.body ?? {};
+    if (typeof badgeId !== 'string' || !VALID_BADGES.has(badgeId)) {
+      return res.status(400).json({ error: 'Unknown badgeId' });
+    }
+    await unlockBadge(getUid(req), badgeId);
     res.json({ success: true });
   } catch (error) {
-    console.error('API /api/badges/unlock error:', error);
-    res.status(500).json({ error: 'Failed to unlock badge' });
+    fail(res, '/api/badges/unlock', error, 'Failed to unlock badge');
   }
 });
 
-// POST /api/daily-reward/claim
+// POST /api/daily-reward/claim — streak and stars are computed on the server; the body is ignored
 apiApp.post('/api/daily-reward/claim', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const email = getEmail(req);
-    const { streak, bonusStars } = req.body;
-    const starsToAdd = typeof bonusStars === 'number' ? bonusStars : 3;
-
-    const user = await getOrCreateUser(uid, email);
-    const newStars = user.stars + starsToAdd;
-    const newLevel = Math.max(1, Math.floor(newStars / 15) + 1);
-
-    await db
-      .update(users)
-      .set({
-        stars: newStars,
-        level: newLevel,
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, user.id));
-
-    if (typeof streak === 'number') {
-      if (streak >= 3) {
-        await unlockBadge(uid, 'daily_streak_3');
-      }
-      if (streak >= 7) {
-        await unlockBadge(uid, 'daily_streak_7');
-      }
-    }
-
-    res.json({ success: true, stars: newStars, level: newLevel, streak });
+    const result = await claimDailyReward(getUid(req));
+    res.json({ success: true, ...result });
   } catch (error) {
-    console.error('API /api/daily-reward/claim error:', error);
-    res.status(500).json({ error: 'Failed to claim daily reward' });
+    fail(res, '/api/daily-reward/claim', error, 'Failed to claim daily reward');
   }
 });
 
 // PATCH /api/settings
 apiApp.patch('/api/settings', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const { soundEnabled, reducedMotion, displayName } = req.body;
-    const updated = await updateUserSettings(uid, { soundEnabled, reducedMotion, displayName });
+    const { soundEnabled, reducedMotion, displayName, playerName } = req.body ?? {};
+    const updated = await updateUserSettings(getUid(req), {
+      soundEnabled: typeof soundEnabled === 'boolean' ? soundEnabled : undefined,
+      reducedMotion: typeof reducedMotion === 'boolean' ? reducedMotion : undefined,
+      displayName: sanitizeName(displayName ?? playerName),
+    });
     res.json({ success: true, user: updated });
   } catch (error) {
-    console.error('API /api/settings error:', error);
-    res.status(500).json({ error: 'Failed to update settings' });
+    fail(res, '/api/settings', error, 'Failed to update settings');
   }
 });
 
-// GET /api/dashboard
+// GET /api/dashboard — scoped to the caller's own identity
 apiApp.get('/api/dashboard', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    const profile = await getUserProfile(uid);
+    const profile = await getUserProfile(getUid(req));
 
     const allSessions = profile?.sessions || [];
     const allFacts = profile?.facts || [];
 
     const totalPracticed = allSessions.length;
-    const totalTimeApproxMinutes = Math.round(totalPracticed * 2.5); // avg 2.5 min per activity
+    const totalTimeApproxMinutes = Math.round(totalPracticed * 2.5);
 
-    // Common tricky facts
     const hardest = allFacts
       .filter((f) => f.attempts > 1)
       .map((f) => ({
@@ -346,7 +378,6 @@ apiApp.get('/api/dashboard', optionalAuth, async (req: Request, res: Response) =
       .sort((a, b) => a.accuracy - b.accuracy)
       .slice(0, 5);
 
-    // Distribution by game type
     const gameTypeCounts: Record<string, number> = {};
     allSessions.forEach((s) => {
       gameTypeCounts[s.gameType] = (gameTypeCounts[s.gameType] || 0) + 1;
@@ -361,20 +392,21 @@ apiApp.get('/api/dashboard', optionalAuth, async (req: Request, res: Response) =
       recentSessions: allSessions.slice(0, 15),
     });
   } catch (error) {
-    console.error('API /api/dashboard error:', error);
-    res.status(500).json({ error: 'Failed to generate dashboard' });
+    fail(res, '/api/dashboard', error, 'Failed to generate dashboard');
   }
 });
 
-// POST /api/progress/reset
+// POST /api/progress/reset — resets only the caller's own progress
 apiApp.post('/api/progress/reset', optionalAuth, async (req: Request, res: Response) => {
   try {
-    const uid = getUid(req);
-    await resetUserProgress(uid);
+    await resetUserProgress(getUid(req));
     res.json({ success: true, message: 'Progress reset successfully' });
   } catch (error) {
-    console.error('API /api/progress/reset error:', error);
-    res.status(500).json({ error: 'Failed to reset progress' });
+    fail(res, '/api/progress/reset', error, 'Failed to reset progress');
   }
 });
 
+// Unknown API routes return JSON 404 instead of falling through to index.html
+apiApp.use('/api', (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found' });
+});

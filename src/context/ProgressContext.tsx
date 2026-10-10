@@ -22,17 +22,7 @@ interface ProgressContextValue {
 }
 
 const LOCAL_STORAGE_KEY = 'mathvoyage_progress_v1';
-const GUEST_UID_KEY = 'mathvoyage_guest_uid';
-
-function getOrCreateGuestId(): string {
-  if (typeof window === 'undefined') return 'guest_default';
-  let id = localStorage.getItem(GUEST_UID_KEY);
-  if (!id) {
-    id = 'guest_' + Math.random().toString(36).substring(2, 10);
-    localStorage.setItem(GUEST_UID_KEY, id);
-  }
-  return id;
-}
+// Guest identity is issued by the server as an HttpOnly cookie; the client no longer chooses it.
 
 const defaultProgress: UserProgress = {
   stars: 0,
@@ -192,8 +182,8 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const getHeaders = (tokenOverride?: string | null) => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'x-guest-uid': getOrCreateGuestId(),
-      'x-player-name': progress.playerName,
+      // URI-encoded: header values must be ISO-8859-1, so raw Arabic text makes fetch() throw.
+      'x-player-name': encodeURIComponent(progress.playerName || ''),
     };
     const t = tokenOverride !== undefined ? tokenOverride : idToken;
     if (t) {

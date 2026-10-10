@@ -1,0 +1,77 @@
+# فُرسان الحساب — production stack.
+# Values come from ./.env (never committed). See .env.example and deploy/DEPLOY.md.
+name: fursan
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_ADMIN_USER:?}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?}
+      POSTGRES_DB: ${DB_NAME:?}
+      APP_DB_USER: ${DB_APP_USER:?}
+      APP_DB_PASSWORD: ${DB_APP_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/db-init:/docker-entrypoint-initdb.d:ro
+    networks: [internal]          # no published port, no internet access
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    mem_limit: 512m
+    logging: *logging
+
+  # One-off: docker compose run --rm migrate
+  migrate:
+    build: .
+    image: fursan-app:latest
+    profiles: ["tools"]
+    command: ["node_modules/.bin/drizzle-kit", "migrate", "--config", "src/db/drizzle.config.ts"]
+    environment:
+      SQL_HOST: db
+      SQL_DB_NAME: ${DB_NAME:?}
+      SQL_ADMIN_USER: ${DB_ADMIN_USER:?}
+      SQL_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:?}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+  app:
+    build: .
+    image: fursan-app:latest
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      SQL_HOST: db
+      SQL_DB_NAME: ${DB_NAME:?}
+      SQL_USER: ${DB_APP_USER:?}
+      SQL_PASSWORD: ${DB_APP_PASSWORD:?}
+      SESSION_SECRET: ${SESSION_SECRET:?}
+    ports:
+      - "127.0.0.1:${APP_PORT:-3100}:3000"   # loopback only; nginx is the public entry point
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [internal, egress]  # egress: Firebase token verification for Google sign-in
+    mem_limit: 512m
+    logging: *logging
+
+networks:
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata:
