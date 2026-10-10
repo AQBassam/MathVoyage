@@ -27,8 +27,7 @@ cd /opt/fursan
 
 ```bash
 cd /opt/fursan
-umask 077
-cat > .env <<EOF
+(umask 077; cat > .env <<EOF
 DB_NAME=fursan
 DB_ADMIN_USER=fursan_admin
 DB_ADMIN_PASSWORD=$(openssl rand -hex 32)
@@ -37,8 +36,12 @@ DB_APP_PASSWORD=$(openssl rand -hex 32)
 SESSION_SECRET=$(openssl rand -hex 32)
 APP_PORT=3100
 EOF
+)
 ls -l .env      # المتوقع: -rw------- root root
 ```
+
+> `umask 077` محصور داخل القوسين عمدًا. لو بقي فعّالًا في الجلسة لخرجت ملفات أي `git pull` لاحق
+> بصلاحية root وحده، فيعجز Postgres عن قراءة سكربت `deploy/db-init` ويتوقف (`Permission denied`).
 
 > `SESSION_SECRET` يوقّع هوية الزوار. تغييره يجعل كل زائر حالي يبدأ بهوية جديدة.
 
