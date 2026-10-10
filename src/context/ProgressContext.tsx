@@ -1,8 +1,9 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { UserProgress, FactMasteryData, GameSessionResult, GameType } from '../types/game.ts';
 import { sound } from '../utils/audio.ts';
 import { auth, googleAuthProvider } from '../lib/firebase.ts';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import { GUEST_OWNER, LOCAL_OWNER_KEY, shouldClearLocal } from '../utils/localOwner.ts';
 
 interface ProgressContextValue {
   progress: UserProgress;
@@ -122,17 +123,42 @@ export function evaluateAllBadges(
 
 const ProgressContext = createContext<ProgressContextValue | null>(null);
 
+const readLocalOwner = (): string | null => {
+  try {
+    return localStorage.getItem(LOCAL_OWNER_KEY);
+  } catch {
+    return null;
+  }
+};
+
+const writeLocalOwner = (owner: string) => {
+  try {
+    localStorage.setItem(LOCAL_OWNER_KEY, owner);
+  } catch {}
+};
+
+const readLocalProgress = (): UserProgress | null => {
+  try {
+    const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (stored) {
+      const parsed = { ...defaultProgress, ...JSON.parse(stored) };
+      return { ...parsed, unlockedBadges: evaluateAllBadges(parsed) };
+    }
+  } catch {}
+  return null;
+};
+
 export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  // An account's cached progress is not rendered until Firebase confirms that
+  // same account is still signed in; only a guest's cache is shown immediately.
+  const accountCacheRef = useRef<{ owner: string; progress: UserProgress } | null>(null);
   const [progress, setProgress] = useState<UserProgress>(() => {
     if (typeof window === 'undefined') return defaultProgress;
-    try {
-      const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (stored) {
-        const parsed = { ...defaultProgress, ...JSON.parse(stored) };
-        const updatedBadges = evaluateAllBadges(parsed);
-        return { ...parsed, unlockedBadges: updatedBadges };
-      }
-    } catch {}
+    const owner = readLocalOwner();
+    const cached = readLocalProgress();
+    if (!cached) return defaultProgress;
+    if (owner === GUEST_OWNER) return cached;
+    if (owner) accountCacheRef.current = { owner, progress: cached };
     return defaultProgress;
   });
 
@@ -148,17 +174,49 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [progress.soundEnabled, progress.soundVolume]);
 
-  // Persist locally
+  // Persist locally (not while an account's cache is still awaiting auth confirmation,
+  // so the default placeholder does not overwrite it)
   useEffect(() => {
+    if (accountCacheRef.current) return;
     try {
       localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(progress));
     } catch {}
   }, [progress]);
 
+  // Wipes everything cached for the previous player, keeping only device settings.
+  const clearAccountLocalData = () => {
+    accountCacheRef.current = null;
+    setProgress((prev) => ({
+      ...defaultProgress,
+      soundEnabled: prev.soundEnabled,
+      soundVolume: prev.soundVolume,
+      reducedMotion: prev.reducedMotion,
+      dailyGoal: { ...defaultProgress.dailyGoal, date: new Date().toISOString().split('T')[0] },
+    }));
+    try {
+      localStorage.removeItem(LOCAL_STORAGE_KEY);
+    } catch {}
+    writeLocalOwner(GUEST_OWNER);
+  };
+
+  // Makes sure the local cache belongs to `identity` before its progress is shown.
+  const adoptLocalOwner = (identity: string) => {
+    const storedOwner = readLocalOwner();
+    const cache = accountCacheRef.current;
+    accountCacheRef.current = null;
+    if (shouldClearLocal(storedOwner, identity)) {
+      clearAccountLocalData();
+    } else if (cache && cache.owner === identity) {
+      setProgress(cache.progress);
+    }
+    writeLocalOwner(identity);
+  };
+
   // Firebase auth listener
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
+      adoptLocalOwner(user ? user.uid : GUEST_OWNER);
       if (user) {
         try {
           const token = await user.getIdToken();
@@ -285,6 +343,7 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const signInWithGoogle = async () => {
     try {
       const result = await signInWithPopup(auth, googleAuthProvider);
+      adoptLocalOwner(result.user.uid);
       const token = await result.user.getIdToken();
       setIdToken(token);
       await syncWithCloud(token, result.user);
@@ -299,6 +358,8 @@ export const ProgressProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       await signOut(auth);
       setCurrentUser(null);
       setIdToken(null);
+      // Shared devices: the next person must not see this account's progress or name.
+      clearAccountLocalData();
     } catch (error) {
       console.error('Sign out error:', error);
     }
